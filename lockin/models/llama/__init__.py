@@ -14,11 +14,12 @@ from torch.distributed import ProcessGroup
 from pydantic import BaseModel
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
-from flash_attn import flash_attn_varlen_func_with_kvcache
+from flash_attn import flash_attn_varlen_func_with_kvcache, flash_attn_varlen_kvpacked_func
 from normalization import FusedRMSNorm
 import torch.nn.functional as F
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardingStrategy
+from torch.utils.checkpoint import checkpoint
 
 
 class ModelArgs(BaseModel, extra="forbid"):
@@ -177,6 +178,7 @@ class Attention(nn.Module):
         xo = xo.view(-1, self.n_local_heads * self.head_dim)
         return self.wo.forward(xo)
 
+
 class FeedForward(nn.Module):
 
     def __init__(
@@ -273,23 +275,23 @@ class TransformerBlock(nn.Module):
 
 class Llama(nn.Module, Model):
 
-    def __init__(self, params: ModelArgs, mesh: DeviceMesh) -> None:
+    def __init__(self, config: ModelArgs, mesh: DeviceMesh) -> None:
         
         super().__init__()
-        self.params = params
-        self.vocab_size = params.vocab_size
-        self.n_layers = params.n_layers
+        self.config = config
+        self.vocab_size = config.vocab_size
+        self.n_layers = config.n_layers
         self.mesh = mesh
         self.tp_group = mesh.get_group("tp")
 
-        self.tok_embeddings = VocabParallelEmbedding(params.vocab_size, params.dim, process_group=self.tp_group)
+        self.tok_embeddings = VocabParallelEmbedding(config.vocab_size, config.dim, process_group=self.tp_group)
 
         self.layers = torch.nn.ModuleList()
-        for layer_id in range(params.n_layers):
-            self.layers.append(TransformerBlock(layer_id, params, tp_group=self.tp_group))
+        for layer_id in range(config.n_layers):
+            self.layers.append(TransformerBlock(layer_id, config, tp_group=self.tp_group))
 
-        self.norm = FusedRMSNorm(params.dim, eps=params.norm_eps)
-        self.output = ColumnParallelLinear(params.dim, params.vocab_size, process_group=self.tp_group)
+        self.norm = FusedRMSNorm(config.dim, eps=config.norm_eps)
+        self.output = ColumnParallelLinear(config.dim, config.vocab_size, process_group=self.tp_group)
 
         self.freqs_cis = torch.tensor(0.0)
         self.cos = torch.tensor(0.0)
@@ -297,9 +299,9 @@ class Llama(nn.Module, Model):
 
     def set_freqs_cis(self) -> None:
         self.freqs_cis, self.cos, self.sin = precompute_freqs_cis(
-            self.params.dim // self.params.n_heads,
-            self.params.max_seq_len * 2,
-            self.params.rope_theta,
+            self.config.dim // self.config.n_heads,
+            self.config.max_seq_len * 2,
+            self.config.rope_theta,
         )
 
     def forward(
@@ -345,7 +347,7 @@ class Llama(nn.Module, Model):
         self.sin = self.sin.to(h.device, h.dtype)
         max_seqlen = torch.max(cu_seqlens[1:] - cu_seqlens[:-1])
 
-        for layer in self.layers:
+        for layer_idx, layer in enumerate(self.layers):
             typed_layer = cast(TransformerBlock, layer)
             h = typed_layer.inference_forward(
                 h,
@@ -353,8 +355,8 @@ class Llama(nn.Module, Model):
                 max_seqlen,
                 self.sin,
                 self.cos,
-                k_cache,
-                v_cache,
+                k_cache[layer_idx],
+                v_cache[layer_idx],
                 cache_seqlens,
                 cache_indices
             )
@@ -367,14 +369,14 @@ class Llama(nn.Module, Model):
         return self.mesh
     
     def init_cache(self, cache_size: int) -> Tensor:
-        assert self.params.n_kv_heads is not None
+        assert self.config.n_kv_heads is not None
         return torch.empty(
             size=[
-                self.params.n_layers,
+                self.config.n_layers,
                 cache_size,
-                self.params.max_seq_len,
-                self.params.n_kv_heads,
-                self.params.dim // self.params.n_heads
+                self.config.max_seq_len,
+                self.config.n_kv_heads // dist.get_world_size(self.tp_group),
+                self.config.dim // self.config.n_heads
             ],
             requires_grad=False
         )
@@ -403,6 +405,13 @@ class Llama(nn.Module, Model):
         torch.set_default_dtype(torch.bfloat16)
         model = Llama(params, mesh)
 
+        torch.set_default_device(device_before)
+        torch.set_default_dtype(dtype_before)
+
+        weights = torch.load(shard_paths[rank], weights_only=True, map_location=device_before)
+        model.set_freqs_cis()
+        model.load_state_dict(weights, assign=True)
+        
         if init_fsdp:
             model = FSDP(
                 model,
@@ -410,12 +419,5 @@ class Llama(nn.Module, Model):
                 sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
                 use_orig_params=True
             )
-
-        torch.set_default_device(device_before)
-        torch.set_default_dtype(dtype_before)
-
-        weights = torch.load(shard_paths[rank], weights_only=True, map_location=device_before)
-        model.set_freqs_cis()
-        model.load_state_dict(weights, assign=True)
 
         return cast(Llama, model)

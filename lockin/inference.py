@@ -3,9 +3,11 @@ from pydantic import BaseModel
 import torch
 from .models import Model
 from .utils import pack
+import torch.distributed as dist
+from tqdm.auto import tqdm
 
 
-class Generation(BaseModel, extra="forbid"):
+class Generation(BaseModel, extra="forbid", arbitrary_types_allowed=True):
     tokens: Tensor
     start: int
     end: int
@@ -22,8 +24,12 @@ def generate(
     max_total_tokens: int,
     eos_id: int,
     k_cache: Tensor,
-    v_cache: Tensor
+    v_cache: Tensor,
+    progress: bool = False,
+    pbar_position: int = 0
 ) -> list[Tensor]:
+    
+    tp_group = model.get_mesh().get_group("tp")
     
     assert k_cache.shape == v_cache.shape
     cache_size = k_cache.shape[1]
@@ -49,7 +55,9 @@ def generate(
     def active_token_count() -> int:
         return sum(len(x.tokens) for x in active.values())
     
-    while len(queue) > 0 and len(active) > 0:
+    pbar = tqdm(total=len(queue), desc="generating", disable=not progress, position=pbar_position)
+    
+    while True:
 
         # Remove items from active if done
         to_remove: list[int] = []
@@ -63,7 +71,8 @@ def generate(
         
         for i in to_remove:
             x = active.pop(i)
-            completed[x.batch_idx] = x.tokens
+            completed[x.batch_idx] = x.tokens[:x.end]
+            pbar.update()
 
         # Enqueue longest items until active is saturated
         while len(queue) > 0 and active_token_count() < max_total_tokens and len(active) < cache_size:
@@ -80,6 +89,9 @@ def generate(
             x = queue.pop(key_to_remove)
             next_slot = min(i for i in range(cache_size) if i not in active)
             active[next_slot] = x
+
+        if len(queue) == 0 and len(active) == 0:
+            break
         
         # Peform a generation step
         cache_indices = list(sorted(active.keys()))
@@ -97,7 +109,7 @@ def generate(
         )
 
         # Sampling
-        next_logits = torch.concat([packed_logits[x-1].view(1) for x in cu_seqlens[1:]], dim=0)
+        next_logits = torch.concat([packed_logits[x-1].view(1, -1) for x in cu_seqlens[1:]], dim=0)
         if temperature == 0:
             next_tokens = torch.argmax(next_logits, dim=-1)
         else:
@@ -105,11 +117,15 @@ def generate(
             next_tokens = torch.multinomial(next_probs, num_samples=1)
 
         next_tokens = next_tokens.reshape(-1)
+        dist.broadcast(next_tokens, group=tp_group, group_src=0)
+
         for i, t in enumerate(next_tokens):
             slot = cache_indices[i]
             next_token = int(t.item())
-            active[i].tokens[active[slot].end] = next_token
+            active[slot].tokens[active[slot].end] = next_token
             active[slot].end += 1
             active[slot].start = active[slot].end - 1
     
-    return list(x[1] for x in sorted(completed.items(), key=lambda x: x[0]))
+    output = list(x[1] for x in sorted(completed.items(), key=lambda x: x[0]))
+    assert len(output) == len(prompts)
+    return output

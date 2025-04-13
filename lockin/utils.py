@@ -125,7 +125,12 @@ def get_balance_communication_pattern(
     if not found_allocation:
         raise RuntimeError(f"Could not find balanced allocation satisfying constraints. Current best guess:\n{send_to=}\n{recv_from=}")
 
-    return num_buckets // dp_size, send_to, recv_from
+    num_local_buckets = num_buckets // dp_size
+    for bucket_idx in range(num_local_buckets):
+        for i, rf in enumerate(recv_from):
+            assert any(any(x[0] == bucket_idx for x in v) for v in rf.values()), f"Expected all buckets to be full, but rank {i} had empty bucket {bucket_idx}"
+    
+    return num_local_buckets, send_to, recv_from
 
 
 def balance(
