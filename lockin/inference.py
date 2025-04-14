@@ -1,3 +1,4 @@
+from typing import Literal
 from torch import Tensor
 from pydantic import BaseModel
 import torch
@@ -10,7 +11,6 @@ from tqdm.auto import tqdm
 class Generation(BaseModel, extra="forbid", arbitrary_types_allowed=True):
     tokens: Tensor
     start: int
-    end: int
     prefix_len: int
     batch_idx: int
 
@@ -39,12 +39,9 @@ def generate(
         assert p.dim() == 1, f"Expected 1 dimensional inputs, but batch item {i} had dimension {p.dim()}"
         assert p.dtype == torch.long, f"Expected long dtype for all inputs, but batch item {i} had dtype {p.dtype}"
         assert len(p) <= max_seq_len, f"Expected all inputs to have at most {max_seq_len} tokens, but batch item {i} has {len(p)} tokens"
-        buf = torch.empty(size=[max_seq_len], dtype=torch.long)
-        buf[:len(p)].copy_(p)
         queue[i] = Generation(
-            tokens=buf,
+            tokens=p,
             start=0,
-            end=len(p),
             prefix_len=len(p),
             batch_idx=i
         )
@@ -62,16 +59,16 @@ def generate(
         # Remove items from active if done
         to_remove: list[int] = []
         for i, x in active.items():
-            if x.end >= max_seq_len:
+            if len(x.tokens) >= max_seq_len:
                 to_remove.append(i)
-            elif x.end - x.prefix_len >= max_new_tokens:
+            elif len(x.tokens) - x.prefix_len >= max_new_tokens:
                 to_remove.append(i)
-            elif x.tokens[x.end-1] == eos_id:
+            elif x.tokens[-1] == eos_id:
                 to_remove.append(i)
         
         for i in to_remove:
             x = active.pop(i)
-            completed[x.batch_idx] = x.tokens[:x.end]
+            completed[x.batch_idx] = x.tokens
             pbar.update()
 
         # Enqueue longest items until active is saturated
@@ -96,7 +93,7 @@ def generate(
         # Peform a generation step
         cache_indices = list(sorted(active.keys()))
         cache_seqlens = [active[i].start for i in cache_indices]
-        tokens = [active[i].tokens[active[i].start:active[i].end] for i in cache_indices]
+        tokens = [active[i].tokens[active[i].start:] for i in cache_indices]
         packed_tokens, cu_seqlens = pack(tokens)
 
         packed_logits = model.inference_forward(
@@ -121,10 +118,9 @@ def generate(
 
         for i, t in enumerate(next_tokens):
             slot = cache_indices[i]
-            next_token = int(t.item())
-            active[slot].tokens[active[slot].end] = next_token
-            active[slot].end += 1
-            active[slot].start = active[slot].end - 1
+            active[slot].start = len(active[slot].tokens)
+            active[slot].tokens = torch.concat([active[slot].tokens, t.view(1)])
+            
     
     output = list(x[1] for x in sorted(completed.items(), key=lambda x: x[0]))
     assert len(output) == len(prompts)

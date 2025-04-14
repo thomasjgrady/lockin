@@ -35,7 +35,6 @@ def _test_inference(rank: int, world_size: int):
         v_cache = model.init_cache(cache_size=cache_size)
 
     xs = list(range(16))
-    ys = [x + 1 for x in xs]
 
     batch = [
         [

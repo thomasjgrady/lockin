@@ -10,7 +10,8 @@ setup(
         "blobfile==3.0.0",
         "pydantic==2.11.3",
         "tiktoken==0.9.0",
-        "tqdm==4.67.1"
+        "tqdm==4.67.1",
+        "fire==0.7.0"
     ],
     extras_require={
         "dev": [

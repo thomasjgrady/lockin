@@ -18,7 +18,6 @@ class MATHDataset(Dataset[list[ChatMessage]]):
         with open(self.data_paths[index], "r") as f:
             data = json.load(f)
             return [
-                ChatMessage(role="system", content=r"Think carefully and answer the given problem step by step. At the end of your response, output your answer in LaTeX like $\boxed{your answer}$"),
                 ChatMessage(role="user", content=data["problem"]),
                 ChatMessage(role="assistant", content=data["solution"]),
             ]
