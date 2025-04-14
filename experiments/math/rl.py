@@ -5,7 +5,7 @@ from lockin.models.llama import Llama
 from lockin.tokenizers import ChatMessage, tokenize_chat_data
 from lockin.tokenizers.llama import LlamaChatFormat, LlamaTokenizer
 from lockin.training import make_linear_schedule, sft_loss
-from lockin.utils import balance, get_balance_communication_pattern, init_distributed, pack
+from lockin.utils import balance, get_balance_communication_pattern, init_distributed, optimizer_to_device, pack
 from pathlib import Path
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm.auto import tqdm
@@ -81,6 +81,11 @@ max_microbatch_size = 4096
 # Set default device to cpu for sampler
 torch.set_default_device("cpu")
 
+# Initialize cache on cpu, move to gpu at each iter
+cache_size = 16
+k_cache = model.init_cache(cache_size=cache_size)
+v_cache = model.init_cache(cache_size=cache_size)
+
 # Run training
 pbar = tqdm(total=num_steps, desc="", disable=dist.get_rank() != 0)
 epoch = 0
@@ -95,15 +100,44 @@ while True:
     loader = DataLoader(train_dataset, batch_size=batch_size_per_replica, collate_fn=lambda x: x)
     for batch_idx, batch in enumerate(loader):
         with torch.device(default_device):
-            
-            # Inference
-            inference_batch: list[ChatMessage] = [
-                [ChatMessage(role="system", content=system_message)] + x[:-1] + [ChatMessage(role="assistant", content="")]
-                for x in batch
-            ]
-            tokens, masks = tokenize_chat_data(batch, chat_format, add_final_eot=True)
-            comm_pattern = get_balance_communication_pattern(tokens, dp_group, bucket_size=max_microbatch_size)
 
-            token_microbatches = balance(tokens, dp_group, comm_pattern)
-            mask_microbatches = balance(masks, dp_group, comm_pattern)
-            num_microbatches = len(token_microbatches)
+            # Move optim to cpu and cache to device
+            optimizer_to_device(optim, torch.device("cpu"))
+            k_cache = k_cache.to(default_device)
+            v_cache = v_cache.to(default_device)
+            
+            # Perform inference
+            typed_batch: list[list[ChatMessage]] = batch
+            questions = [x[0].content for x in typed_batch]
+            ground_truth_responses = [x[1].content for x in typed_batch]
+            ground_truth_answers = [parse_answer(x[1].content) for x in typed_batch]
+            
+            prompts = list(itertools.chain.from_iterable([
+                [
+                    [
+                        ChatMessage(role="system", content=system_message),
+                        ChatMessage(role="user", content=q),
+                        ChatMessage(role="assistant", content="")
+                    ]
+                    for _ in range(rollouts_per_sample)
+                ]
+                for q in questions
+            ]))
+            tokens, _ = tokenize_chat_data(prompts, chat_format, add_final_eot=False)
+            seqlens = [len(x) for x in tokens]
+            generations = generate(
+                model,
+                tokens,
+                temperature=0,
+                max_new_tokens=4096,
+                max_seq_len=model.config.max_seq_len,
+                max_total_tokens=model.config.max_seq_len,
+                eos_id=chat_format.eot_id(),
+                k_cache=k_cache,
+                v_cache=v_cache,
+                progress=dist.get_rank() == 0,
+                pbar_position=1
+            )
+            responses = [chat_format.decode(x[n:].tolist()) for x, n in zip(generations, seqlens)]
+            answers = [parse_answer(x) for x in responses]
+            scores = [score_answer(a, gt) for a, gt in zip(answers, ground_truth_answers)]

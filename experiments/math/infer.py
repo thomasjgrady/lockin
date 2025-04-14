@@ -43,7 +43,7 @@ def main(model_name: str) -> None:
     system_message = r"Think carefully and answer the given problem step by step. At the end of your response, output your answer in LaTeX like $\boxed{your answer}$"
 
     results: list[dict] = []
-    cache_size = 24
+    cache_size = 16
     k_cache = model.init_cache(cache_size)
     v_cache = model.init_cache(cache_size)
 

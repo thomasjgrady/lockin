@@ -6,6 +6,7 @@ from typing import Callable, Literal
 import math
 import torch
 import torch.distributed as dist
+from torch.optim import Optimizer
 
 
 def pack(xs: list[Tensor]) -> tuple[Tensor, Tensor]:
@@ -179,3 +180,9 @@ def balance(
 
 def normalize(x: Tensor, eps: float = 1e-10) -> Tensor:
     return (x - x.mean(dim=-1)) / (x.std(dim=-1) + eps)
+
+def optimizer_to_device(optimizer: Optimizer, device: torch.device):
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if isinstance(v, torch.Tensor):
+                state[k] = v.to(device)
